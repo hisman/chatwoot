@@ -3,7 +3,7 @@ class Api::V1::Accounts::ConversationsController < Api::V1::Accounts::BaseContro
   include DateRangeHelper
 
   before_action :conversation, except: [:index, :meta, :search, :create, :filter]
-  before_action :contact_inbox, only: [:create]
+  before_action :inbox, :contact, :contact_inbox, only: [:create]
 
   def index
     result = conversation_finder.perform
@@ -75,10 +75,13 @@ class Api::V1::Accounts::ConversationsController < Api::V1::Accounts::BaseContro
   end
 
   def update_last_seen
-    # rubocop:disable Rails/SkipsModelValidations
-    @conversation.update_column(:agent_last_seen_at, DateTime.now.utc) && UpdateLastSeenJob.perform_later(@conversation.id, DateTime.now.utc)
-    @conversation.update_column(:assignee_last_seen_at, DateTime.now.utc) if assignee?
-    # rubocop:enable Rails/SkipsModelValidations
+    update_last_seen_on_conversation(DateTime.now.utc, assignee?)
+  end
+
+  def unread
+    last_incoming_message = @conversation.messages.incoming.last
+    last_seen_at = last_incoming_message.created_at - 1.second if last_incoming_message.present?
+    update_last_seen_on_conversation(last_seen_at, true)
   end
 
   def custom_attributes
@@ -87,6 +90,13 @@ class Api::V1::Accounts::ConversationsController < Api::V1::Accounts::BaseContro
   end
 
   private
+
+  def update_last_seen_on_conversation(last_seen_at, update_assignee)
+    # rubocop:disable Rails/SkipsModelValidations
+    @conversation.update_column(:agent_last_seen_at, last_seen_at)
+    @conversation.update_column(:assignee_last_seen_at, last_seen_at) if update_assignee.present?
+    # rubocop:enable Rails/SkipsModelValidations
+  end
 
   def set_conversation_status
     status = params[:status] == 'bot' ? 'pending' : params[:status]
@@ -109,22 +119,35 @@ class Api::V1::Accounts::ConversationsController < Api::V1::Accounts::BaseContro
     authorize @conversation.inbox, :show?
   end
 
+  def inbox
+    return if params[:inbox_id].blank?
+
+    @inbox = Current.account.inboxes.find(params[:inbox_id])
+    authorize @inbox, :show?
+  end
+
+  def contact
+    return if params[:contact_id].blank?
+
+    @contact = Current.account.contacts.find(params[:contact_id])
+  end
+
   def contact_inbox
     @contact_inbox = build_contact_inbox
 
+    # fallback for the old case where we do look up only using source id
+    # In future we need to change this and make sure we do look up on combination of inbox_id and source_id
+    # and deprecate the support of passing only source_id as the param
     @contact_inbox ||= ::ContactInbox.find_by!(source_id: params[:source_id])
     authorize @contact_inbox.inbox, :show?
   end
 
   def build_contact_inbox
-    return if params[:contact_id].blank? || params[:inbox_id].blank?
-
-    inbox = Current.account.inboxes.find(params[:inbox_id])
-    authorize inbox, :show?
+    return if @inbox.blank? || @contact.blank?
 
     ContactInboxBuilder.new(
-      contact_id: params[:contact_id],
-      inbox_id: inbox.id,
+      contact: @contact,
+      inbox: @inbox,
       source_id: params[:source_id]
     ).perform
   end
@@ -150,10 +173,10 @@ class Api::V1::Accounts::ConversationsController < Api::V1::Accounts::BaseContro
   end
 
   def conversation_finder
-    @conversation_finder ||= ConversationFinder.new(current_user, params)
+    @conversation_finder ||= ConversationFinder.new(Current.user, params)
   end
 
   def assignee?
-    @conversation.assignee_id? && current_user == @conversation.assignee
+    @conversation.assignee_id? && Current.user == @conversation.assignee
   end
 end
